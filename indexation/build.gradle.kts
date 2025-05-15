@@ -8,6 +8,7 @@ dependencies {
     implementation(libs.kotlin.compiler.ide) {
         isTransitive = false
     }
+  //implementation(kotlin("stdlib-jdk8"))
 }
 
 application {
@@ -51,4 +52,10 @@ tasks.withType<JavaExec> {
         wasmIndicesJson,
         composeWasmIndicesJson,
     )
+}
+repositories {
+  mavenCentral()
+}
+kotlin {
+  jvmToolchain(17)
 }

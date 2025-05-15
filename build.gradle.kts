@@ -16,11 +16,13 @@ plugins {
     alias(libs.plugins.spring.boot)
     alias(libs.plugins.kotlin.jvm)
     alias(libs.plugins.kotlin.plugin.spring)
+    //kotlin("jvm")
 }
 
 kotlin.jvmToolchain {
     languageVersion.set(JavaLanguageVersion.of(17))
     vendor.set(JvmVendorSpec.AMAZON)
+    //jvmToolchain(8)
 }
 
 apply<NodeJsRootPlugin>()
@@ -85,6 +87,7 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
 
     resourceDependency(libs.skiko.js.wasm.runtime)
+    //implementation(kotlin("stdlib-jdk8"))
 }
 
 fun buildPropertyFile() {
@@ -177,4 +180,7 @@ tasks.withType<Test> {
     doFirst {
         this@withType.environment("kotlin.wasm.node.path", executablePath)
     }
+}
+repositories {
+    mavenCentral()
 }
