@@ -13,7 +13,7 @@ kotlinx-coroutines = "1.7.3"
 kotlinx-coroutines-test = "1.6.4"
 kotlinx-datetime = "0.6.0-RC.2"
 kotlinx-io = "0.7.0"
-kotlinx-serialization = "1.7.1"
+kotlinx-serialization = "1.7.3"
 skiko = "0.8.15"
 # don't forget to update jackson version in `executor.policy` file.
 jackson = "2.14.0"
@@ -64,7 +64,34 @@ compose-material = { group = "org.jetbrains.compose.material", name = "material"
 compose-material3 = { group = "org.jetbrains.compose.material3", name = "material3", version.ref = "compose" }
 compose-components-resources = { group = "org.jetbrains.compose.components", name = "components-resources", version.ref = "compose" }
 kotlin-serialization-plugin = {group= "org.jetbrains.kotlin", name="kotlin-serialization-compiler-plugin", version.ref = "kotlin"}
+kotlin-exoquery-plugin = { group = "io.exoquery", name = "exoquery-plugin-kotlin", version = "2.1.20-LA.1.2.4.PL" }
+kotlin-exoquery-runtime = { group = "io.exoquery", name = "exoquery-engine", version = "2.1.20-LA.1.2.4.PL" }
+#io.exoquery:decomat-core-jvm:0.4.0
+decomat = { group = "io.exoquery", name = "decomat-core-jvm", version = "0.4.0" }
+#org.jetbrains.kotlinx:kotlinx-datetime:0.6.0
+kotlin-serialization-datetime = { group = "org.jetbrains.kotlinx", name = "kotlinx-datetime", version = "0.6.0" }
+#com.github.vertical-blank:sql-formatter:2.0.4
+sqlformatter = { group = "com.github.vertical-blank", name = "sql-formatter", version = "2.0.4" }
+#io.exoquery:terpal-runtime:2.1.20-2.0.0.PL
+terpal-runtime = { group = "io.exoquery", name = "terpal-runtime", version = "2.1.20-2.0.0.PL" }
+#io.exoquery:pprint-kotlin-core-jvm:3.0.0
+pprint-kotlin-core = { group = "io.exoquery", name = "pprint-kotlin-core-jvm", version = "3.0.0" }
+#io.exoquery:pprint-kotlin-kmp-jvm:3.0.0
+pprint-kotlin-kmp = { group = "io.exoquery", name = "pprint-kotlin-kmp-jvm", version = "3.0.0" }
+pprint-kotlin-java = { group = "io.exoquery", name = "pprint-kotlin", version = "3.0.0" }
+kotlinx-serialization-protobuf-jvm = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-protobuf-jvm", version.ref = "kotlinx-serialization" }
+
 #gradle-develocity = {group = "com.gradle", name= "develocity-gradle-plugin", version.ref = "gradle-develocity"}
+
+
+
+
+
+
+
+#target.dependencies.add("kotlinNativeCompilerPluginClasspath", "io.exoquery:pprint-kotlin:3.0.0")
+#target.dependencies.add("kotlinNativeCompilerPluginClasspath", "org.jetbrains.kotlinx:kotlinx-serialization-protobuf:1.7.3")
+
 
 [bundles]
 kotlin-stdlib = ["kotlin-stdlib", "kotlin-stdlib-jdk7", "kotlin-stdlib-jdk8"]
