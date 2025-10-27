@@ -64,8 +64,8 @@ compose-material = { group = "org.jetbrains.compose.material", name = "material"
 compose-material3 = { group = "org.jetbrains.compose.material3", name = "material3", version.ref = "compose" }
 compose-components-resources = { group = "org.jetbrains.compose.components", name = "components-resources", version.ref = "compose" }
 kotlin-serialization-plugin = {group= "org.jetbrains.kotlin", name="kotlin-serialization-compiler-plugin", version.ref = "kotlin"}
-kotlin-exoquery-plugin = { group = "io.exoquery", name = "exoquery-plugin-kotlin", version = "2.1.20-LA.1.2.4.PL" }
-kotlin-exoquery-runtime = { group = "io.exoquery", name = "exoquery-engine", version = "2.1.20-LA.1.2.4.PL" }
+kotlin-exoquery-plugin = { group = "io.exoquery", name = "exoquery-plugin-kotlin", version = "2.2.20-1.7.2.PL" }
+kotlin-exoquery-runtime = { group = "io.exoquery", name = "exoquery-engine", version = "2.2.20-1.7.2.PL" }
 #io.exoquery:decomat-core-jvm:0.4.0
 decomat = { group = "io.exoquery", name = "decomat-core-jvm", version = "0.4.0" }
 #org.jetbrains.kotlinx:kotlinx-datetime:0.6.0
