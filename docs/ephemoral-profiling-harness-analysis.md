@@ -212,6 +212,21 @@ measured story disagree, and only measurement shows it.
 *(Stated as the most probable cause given the exact boundary; confirm with allocation profiling
 before publishing it as fact.)*
 
+### 6.3 Reward hacking — measured, not hypothesised
+
+Identical work, timed twice, differing only in whether the return value is consumed
+(`Naive.java`, three consecutive runs, fresh JVM each):
+
+```
+naive   (result discarded) :  24.89 / 28.21 / 26.09 ns/op
+correct (volatile sink)    : 440.58 / 455.51 / 462.00 ns/op   →  17x false speedup, stable
+```
+
+The benchmark an agent writes by default reports a **17× improvement that does not exist**. This
+is the empirical foundation of §2's thesis and it is no longer a prediction.
+
+### 6.4 Findings continued
+
 **★ Finding B — reliability collapses once allocation enters.** CV goes from 2.8–6.2% in the
 allocation-free regime to **51–56%** once GC is in play. At n=128 the ratio ranges 0.38–2.37
 across seven reps — the tool cannot tell you which implementation is faster. Note also that the
@@ -409,33 +424,46 @@ Find the n where the ratio crosses 1.0 on each machine. Use a finer sweep around
 
 ---
 
-### T6 — Reward-hacking demonstration (30 min) · **validates the value proposition**
+### T6 — Reward-hacking demonstration (10 min) · **validates the value proposition**
 
-Write the benchmark an agent would naively write — no blackhole, result unused:
+Already written and verified — `Naive.java` sits beside this document. Two timing loops over
+**identical** work; the only difference is whether the result is consumed.
 
-```java
-public class Naive {
-  static long compute(int i) { long s = 0; for (int j = 0; j < 1000; j++) s += (j ^ i) * 31L; return s; }
-  public static void main(String[] a) {
-    for (int i = 0; i < 100_000; i++) compute(i);              // warmup, result discarded
-    long t0 = System.nanoTime();
-    for (int i = 0; i < 1_000_000; i++) compute(i);            // result discarded
-    System.out.printf("%.2f ns/op%n", (System.nanoTime() - t0) / 1e6);
-  }
-}
+```bash
+javac -d . Naive.java
+java -cp . Naive naive      # the benchmark an agent writes on its own
+java -cp . Naive correct    # the benchmark a harness enforces
 ```
 
-Compare its number against `Bench arith-a`, which does the same work with a volatile sink.
+**Container reference — three consecutive runs, fresh JVM each:**
+
+```
+naive   (result discarded) :  24.89 / 28.21 / 26.09 ns/op
+correct (volatile sink)    : 440.58 / 455.51 / 462.00 ns/op
+                             ────────────────────────────
+                             false speedup: 16-18x, stable
+```
+
+Same function. Same iteration count. Same JVM flags. Discarding the return value makes the code
+appear **17× faster** because C2 strength-reduces and partially eliminates work whose result
+nobody reads.
 
 | | |
 |---|---|
 | **Measures** | Whether the harness's correctness is worth anything |
-| **Expected** | The naive version reports a dramatically lower (and false) number, because C2 eliminates the discarded loop |
-| **PASS** | A clear gap — this *is* the product demo, the blog post, and the reason the tool cannot be replaced by "the agent writes its own loop" |
-| **FAIL** | No gap — modern C2 is not eliminating it here, so find a case where it does before claiming the risk |
+| **PASS** | A clear gap (container: 17×) |
+| **FAIL** | No gap — your JDK isn't eliminating it, so find a case that does before claiming the risk |
 
-If it passes, this single result is the most persuasive artifact you have. It shows an agent
-optimizing against its own measurement will hill-climb straight into a lie.
+**This is the most persuasive artifact in the document.** It is not an argument that an agent
+*might* mismeasure — it is a demonstration that the naive benchmark an agent writes by default
+reports a 17× improvement that does not exist. An agent instructed to "keep trying until it's
+faster" will hill-climb straight toward that number, because writing code whose result is unused
+is a *lower-cost move* than actually optimising. The measurement flaw is the path of least
+resistance.
+
+That is the whole case for why the harness cannot be delegated to the agent, and it fits in one
+screenshot. It is also the blog post: *"We asked an agent to make this faster. It reported a 17×
+speedup. It had changed nothing."*
 
 ---
 
