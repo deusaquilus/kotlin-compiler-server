@@ -133,6 +133,24 @@ each fails against the design as finally specified.
    benchmark lies because you tested at 10k rows and production has 1M."* This is *"your
    microbenchmark lies because you tested at n=100 and production has n=100,000."* Same
    argument, same scale-point methodology `benchmarkSql` already uses, same voice.
+7. **The build cost is a mode, not an architecture.** `kotlin-compiler-server` is already
+   stateless: `usingTempDirectory` creates a UUID-named directory and `deleteRecursively`s it
+   in a `finally`; every request compiles into a fresh temp dir and executes in a fresh child
+   JVM under a freshly written policy file. There is no persistent state to discard because
+   there is none. The ephemerality this product needs is not something you would be building —
+   it is what the repository already does. That materially lowers the cost side of the
+   decision, and it is why this repo is the right host rather than a new long-lived service.
+8. **It costs the caller no new idiom.** `analyzeHibernateQueries` already establishes the
+   shape: a trusted bootstrap entrypoint (`HibBootstrap.withSession(entities) { … }`), an
+   ephemeral environment, structured findings with hints, everything destroyed afterwards.
+   A `ProfileBootstrap.measure { … }` contract is the same shape with a different payload, so
+   an agent that has learned one has effectively learned both. Adoption cost for the consumer
+   is close to zero — which matters more than usual when the consumer is a model that has to
+   infer correct usage from a tool description.
+
+   The two are also genuinely complementary rather than overlapping: `analyzeHibernateQueries`
+   answers *what SQL was emitted*, this answers *which implementation is faster*. Measuring a
+   Hibernate workload through both is a real use case for each.
 
 ---
 

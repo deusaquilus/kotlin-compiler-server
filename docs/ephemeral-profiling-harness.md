@@ -10,7 +10,23 @@ a language model to diff.
 | **Branch** | `claude/exoquery-kotlin-compiler-btw1dy` |
 | **Kotlin** | 2.1.20 |
 | **Target JDK** | 17 (`jvmToolchain` 17, Amazon Corretto) |
-| **Status** | Ready to implement — all mechanisms empirically verified against the real sandbox |
+| **Status** | **On hold** — mechanically ready, but see the scope note below |
+
+> ### Scope of this document
+>
+> This is **use-case description and implementation plan only**. It assumes the decision to
+> build has already been made. Whether the product should exist, what it is worth, and what
+> evidence would justify starting are **not** in here — they live in
+> [`ephemoral-profiling-harness-analysis.md`](ephemoral-profiling-harness-analysis.md).
+>
+> **Read that document first.** It currently concludes that the likely product is a
+> *comparative microbenchmark verifier*, which is a different tool from the profiler specified
+> here, and that neither should be built until experiments T1–T8 pass. This plan is therefore
+> on hold rather than ready.
+>
+> What survives either outcome, and is worth reading regardless: §6.1 (sandbox permission
+> table), §6.2 (policy grants), §6.5 (a real Dockerfile bug), the `-XX:TieredStopAtLevel=1`
+> finding in §5.1, and the plumbing patterns in §9.2.
 
 ---
 
@@ -39,39 +55,27 @@ a Kotlin snippet, POSTs it, receives a small structured result, and discards eve
 then repeats dozens or hundreds of times to answer questions like *"which of these three
 ExoQuery formulations is actually cheaper?"*
 
-Four consequences drive every decision below:
+### Derived requirements
 
-| Property | Why it dominates |
+Four properties of that consumer are binding requirements on the implementation. Treat them as
+acceptance criteria, not aspirations.
+
+| Requirement | What it forces |
 |---|---|
-| **Determinism over fidelity** | An agent comparing A to B reads run-to-run noise as signal. Reproducible numbers beat production-realistic ones. |
-| **Small output** | Every returned byte costs agent context. A collapsed-stack dump is harmful; a top-N table with stable keys is what's needed. The agent's primary operation is *subtracting two results*. |
-| **Throughput** | 200 experiments at 3 s each is ten minutes; at 0.5 s it's ninety seconds. That gap decides whether the loop is usable. |
-| **Machine-readable diagnostics** | An agent will write bodies that get dead-code-eliminated. A finding with an actionable `hint` is worth as much as the timing. |
+| **Determinism over fidelity** | Pin the JIT tier (§3, term 4). Identical input must yield identical output. Reproducibility outranks production-realism. |
+| **Small output** | Cap `frames` and `calls` at top-N (§9.4). Stable keys, because the caller's primary operation is *subtracting two results*. Never emit a full collapsed-stack dump. |
+| **Throughput** | Per-request latency is a feature. Measure it before optimising anything else (§10, P0). |
+| **Machine-readable diagnostics** | Every finding carries an actionable `hint` (§9.6). A caller that mismeasures must be told how to fix it, in a field it can branch on. |
 
-### The ephemerality is already free
+### Convention alignment
 
-The existing architecture is already stateless. `usingTempDirectory` creates a UUID-named
-directory and `deleteRecursively`s it in a `finally`; every run compiles into a fresh temp dir
-and executes in a fresh child JVM with a freshly written policy file. There is no persistent
-state to discard because there is none. **This is why this repository is the right host** for
-the idea rather than a long-lived benchmark service. You are adding a mode, not an
-architecture.
+The contract in §3, the response envelope in §9.4, and the findings-with-hints format in §9.6
+deliberately mirror ExoBench's `analyzeHibernateQueries`, whose trusted entrypoint is
+`hib.bootstrap.HibBootstrap.withSession(entityClasses) { sf -> … }`. Ours is
+`executors.ProfileBootstrap.measure { … }`.
 
-### Prior art in the same product family
-
-ExoBench already ships `analyzeHibernateQueries`, which follows exactly this shape: compile
-Kotlin or Java, run it against an ephemeral in-memory H2, capture an instrumentation
-transcript, return structured findings, destroy everything. **This plan deliberately mirrors
-its conventions** — the bootstrap-lambda contract (§3), the response envelope (§9.5), and the
-findings-with-hints format — so the consuming agent meets one idiom rather than two.
-
-Its trusted entrypoint is `hib.bootstrap.HibBootstrap.withSession(entityClasses) { sf -> … }`.
-Ours is `executors.ProfileBootstrap.measure { … }`. Same idea, same reason.
-
-The two tools are complementary: `analyzeHibernateQueries` answers *what SQL was emitted*;
-this one answers *where the JVM time went*. Profiling a Hibernate run through this harness —
-seeing reflection, proxy initialization and entity hydration costs — is a strong use case for
-both.
+Match those shapes when in doubt — a caller that already knows one should not have to learn a
+second idiom. Rationale for the alignment is in the analysis document.
 
 ---
 
@@ -309,12 +313,16 @@ Everything you will create or modify. Nothing else is required.
 
 ---
 
-## 5. Evidence
+## 5. Design rationale — why these specific decisions
 
-Every table here was produced by running both backends against an identical
-setup/warmup/N contract over a target with a known cost distribution: four methods
-(`heavy`, `medium`, `light`, `tiny`) whose isolated, unprobed costs were measured first.
-Appendix A reproduces all of it.
+Four spec decisions are load-bearing and non-obvious, so each is defended with measurement:
+the pinned JIT tier, excluding setup from the window, defaulting to instrumentation, and
+offering a `both` mode. **Do not remove any of them without re-running the experiment that
+justified it** — Appendix A reproduces all of them.
+
+Every table below came from running both backends against an identical setup/warmup/N contract
+over a target with a known cost distribution: four methods (`heavy`, `medium`, `light`, `tiny`)
+whose isolated, unprobed costs were measured first.
 
 **Ground truth** — each method timed alone, unprobed, fully JIT-compiled **[MEASURED]**:
 
@@ -1541,14 +1549,10 @@ acceptance criteria pass.
 
 ### P0 — Measure the latency budget (½ day) — **do this first**
 
-> Throughput is the entire value proposition, and the strong prior is that **the Kotlin compile
-> dominates, not the profiled execution**. The `analyzeHibernateQueries` docs show a `timings`
-> block with `compileMs` in the ~1.8 s range for a comparable workload — illustrative rather
-> than measured here, but it means a sibling tool already tracks exactly this split and puts
-> compile in seconds, not milliseconds. If that holds, the backend choice barely matters and
-> the real work is compile caching or warm-environment reuse. **It also decides how much the
-> named-blocks feature (§3) is worth** — amortizing a 2 s compile over four variants is a
-> large win; amortizing a 50 ms compile is not.
+> Per-request latency is a hard requirement (§1), and the working assumption is that the Kotlin
+> compile dominates rather than the profiled execution. Establish the split before building
+> anything that depends on it: if compile dominates, compile caching outranks every other item
+> in this plan, and the named-blocks feature in §3 becomes considerably more valuable.
 
 1. Instrument `KotlinCompiler.execute` with timers around `compile()`, `write()`, and
    `javaExecutor.execute()`.
@@ -1700,8 +1704,7 @@ Steady-state timings will not be bit-identical; assert within a tolerance (≤ 5
 
 ### Unresolved
 
-- **Per-run latency budget is unmeasured here.** P0 closes it. It is the highest-value half-day
-  in the plan, and it also sets the value of named blocks.
+- **Per-request latency budget is unmeasured.** P0 closes it. Its result may reorder the plan.
 - **Library-internal memoization inside a block is detectable but not attributable.** The
   `firstCallNs` / `steadyNsPerIter` gap reveals that it happened; it does not say where.
   Attributing it requires instrumenting the first call specifically — counts are exact
