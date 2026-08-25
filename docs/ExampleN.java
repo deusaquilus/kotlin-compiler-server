@@ -1,6 +1,6 @@
 import java.util.*;
 
-public class PairCounter {
+public class ExampleN {
 
     /**
      * Counts the number of index pairs (i, j) with i < j where

@@ -1,7 +1,7 @@
 import java.util.*;
 
-public class Optimal {
-    /** Returns, for each value, how many times it occurs. Single pass. */
+public class ExampleO {
+    /** Returns, for each value in 0..range-1, how many times it occurs in the input. */
     public static int[] histogram(int[] values, int range) {
         int[] counts = new int[range];
         for (int v : values) counts[v]++;
