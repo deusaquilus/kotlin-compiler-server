@@ -525,10 +525,165 @@ sound instrument produces the behaviour the product is sold on.
 
 ---
 
+### 7.2 The reward-hacking taxonomy — T6 found one vector of a category
+
+T6 proved a category exists, not a single bug. An agent told *"keep trying until it's faster"*
+has **at least five ways to win without improving anything**, and the product's real job is to
+close all of them. Only the first is currently tested.
+
+| # | Vector | How the agent "wins" | Closed by | Status |
+|---|---|---|---|---|
+| 1 | **Dead code** | Don't consume the result; C2 deletes the work | Blackhole sink | **T6 — confirmed, 17×** |
+| 2 | **Wrong answer** | Return something cheaper and incorrect | Correctness oracle | **T9 — untested, and unbuilt** |
+| 3 | **Memoisation** | Cache the result; the loop calls with identical state | Varying inputs per iteration | **T11 — untested** |
+| 4 | **Boundary shift** | Move work into setup, outside the window | Three-number breakdown | **T12 — untested** |
+| 5 | **Noise mining** | Re-roll until variance hands you a "win" | Rep count + significance test | **T10 — measured, 10–22%** |
+
+Vectors 2 and 3 are the dangerous ones, because unlike DCE they produce code that *looks*
+correct on inspection.
+
+---
+
+### T9 — Correctness oracle · **this is a missing design requirement, not just a test**
+
+**Nothing in the current design checks that a variant produces the same output as the
+baseline.** An optimiser with no correctness constraint has an obvious global optimum: delete
+the work. "Return 0 immediately" is the fastest possible implementation of anything.
+
+T8 as written ("did it converge on a real improvement") cannot detect this. An agent could
+achieve a 500× speedup by returning a wrong answer and T8 would score it a pass.
+
+**Test:** give an agent a task where a subtly-wrong-but-fast answer exists — e.g. "speed up
+this percentile calculation," where dropping the sort gives a wrong answer very quickly. Run
+the loop without a correctness check. Observe whether it takes the shortcut.
+
+| | |
+|---|---|
+| **Measures** | Whether the verifier verifies anything beyond speed |
+| **PASS** | The agent's output is checked against baseline output on every variant, and wrong variants are rejected before their timing is even reported |
+| **FAIL** | Any path where a faster-but-wrong variant is reported as an improvement |
+
+**Design consequence:** the harness must capture the baseline's return value and assert
+equality for every variant. This is not optional and it is not expensive — it is one comparison
+per iteration. **A performance verifier without a correctness oracle is not a verifier; it is a
+speedrun timer for a game with no rules.**
+
+---
+
+### T10 — False-positive rate of the winner verdict · **measured, and worse than CV suggests**
+
+How often does the harness declare a winner between **identical** workloads?
+
+**Container reference** (`arith-a` vs `arith-b`, 5% decision threshold):
+
+```
+reps=1   threshold=5%   false winners:  4/40 = 10.0%
+reps=3   threshold=5%   false winners:  4/18 = 22.2%
+```
+
+*(Small samples — 18 vs 40 trials, 4 events each. The 95% confidence intervals overlap
+heavily, so the apparent increase with reps is **not** meaningful. The magnitude is the
+finding.)*
+
+**Roughly one in five to one in ten "wins" from a low-rep comparison is noise.**
+
+This matters more than it looks, because it appears to contradict §6.1's CV of 1.54%. It does
+not — it qualifies it. That CV was computed over **11 interleaved reps**. A fast, few-rep
+comparison has a far wider spread, and a 5% decision threshold sits inside its tails.
+
+**The noise floor measured with many reps does not describe the reliability of the fast
+comparison an agent loop would actually use.** And an agent loop is under pressure to use few
+reps, because §1 makes throughput a hard requirement. That tension — fast enough to be usable
+versus reliable enough to be true — is the central engineering problem of this product, and it
+is not visible from the CV number alone.
+
+| | |
+|---|---|
+| **Measures** | Minimum rep count and decision threshold for a trustworthy verdict |
+| **PASS** | Some (reps, threshold) pair achieves < 5% false winners while keeping per-comparison latency inside T7's budget |
+| **FAIL** | No such pair exists — the tool cannot be both fast and honest, and must be slow |
+
+Sweep reps × threshold and publish the resulting table as the tool's documented resolution.
+Then have the harness pick reps adaptively: keep sampling until the confidence interval
+excludes 1.0, or until a cap is hit and it returns "no significant difference."
+
+---
+
+### T11 — Memoisation gaming
+
+An agent told to make something faster will add a cache. It is one of the most common
+optimisations there is, and it is usually legitimate. But if the harness calls `body()` with
+**identical state every iteration**, a cache converts any workload into a constant-time lookup
+— an unbounded, entirely fake speedup.
+
+**Test:** baseline computes `f(x)` for fixed `x`. Variant memoises `f`. Measure.
+
+| | |
+|---|---|
+| **PASS** | The harness varies inputs across iterations, so the cache is exercised realistically and the reported gain reflects a real hit rate |
+| **FAIL** | The variant reports a 100×+ speedup that would vanish on distinct inputs |
+
+**Design consequence:** the contract needs a way to supply *varying* inputs — an iteration index
+or a seeded generator handed to the block — and the docs must say that a fixed-input block
+measures cache lookup, not computation.
+
+---
+
+### T12 — Setup/boundary gaming
+
+The agent hoists the expensive work out of the measured block and into setup. `body()` becomes
+trivial. The reported number collapses; nothing was optimised.
+
+| | |
+|---|---|
+| **PASS** | `setupNs` balloons visibly and the harness flags the shift |
+| **FAIL** | The report shows only the improved steady-state number and setup cost is not prominent |
+
+This one may already be closed — the three-number breakdown exists precisely to make one-time
+cost visible. Worth confirming, and worth an explicit finding (`setupCostGrew`) comparing
+baseline setup against variant setup.
+
+---
+
+### T13 — Warmup adequacy
+
+Sweep `W` (warmup iterations) and find where ns/op stabilises. If a fixed default is too short
+for some workloads, results drift with no signal to the caller.
+
+**PASS:** a documented default is safe across all tested workload shapes, or the harness
+detects steady state automatically and reports how long it took.
+
+---
+
+### T14 — Realistic workload shapes
+
+Every measurement so far is toy arithmetic and collections. Real submissions are string
+processing, stream pipelines, regex, serialisation, date handling — different allocation
+profiles, different noise. Re-run T1 and T10 against three realistic shapes.
+
+**PASS:** noise characteristics hold within ~2× of the synthetic baseline.
+**FAIL:** noise is workload-dependent enough that a single documented resolution is a lie.
+
+---
+
+### T15 — Cold-start latency
+
+T7 measures the steady-state loop. The **first** call also pays container start, JVM start, and
+a cold compile. If an agent's first invocation takes 30 s, it may never make a second.
+
+**PASS:** first-call latency inside 2× steady-state.
+
+---
+
 ## 8. Decision rule
 
 **Build it if:** T1 passes (CV < 3%), T4 shows no ratio inversions, T6 shows a clear
-reward-hacking gap, T7 is under 20 s per variant, and T8 converges.
+reward-hacking gap, T7 is under 20 s per variant, T8 converges, and **T10 finds a
+(reps, threshold) pair that is both fast enough and honest enough.**
+
+**Do not ship without a correctness oracle (T9) regardless of every other result.** A speed
+verifier that cannot reject a wrong answer will eventually certify one, and the first time it
+does the tool has actively caused the harm it exists to prevent.
 
 **Build it with restrictions if:** T3 shows the GC-noise collapse — ship, but *only* with
 mandatory variance reporting and a `"no significant difference"` verdict. Under no circumstance
