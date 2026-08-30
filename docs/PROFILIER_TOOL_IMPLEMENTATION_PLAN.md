@@ -319,7 +319,7 @@ The caller is a language model. It will eventually send `iterations: 100000000`.
 | `samplePeriodMs` | 1 | 1 – 20 | clamp |
 | `code` total size | — | 512 KB | `status:"rejected"`, finding `codeTooLarge` |
 | `schema` size | — | 256 KB | `status:"rejected"` |
-| measure blocks per submission | — | 8 | `status:"rejected"`, finding `tooManyBlocks` |
+| measure blocks per submission | — | **exactly 1** | second `measure()` call fails the run: `status:"runtimeError"`, finding `multipleMeasureBlocks` (§5) |
 | wall clock per request | — | 60 s child + 30 s compile | `status:"timeout"` with partial timings if available |
 
 Defaults are applied in `profiler-core`, not in the adapters, so MCP and REST cannot drift.
@@ -342,21 +342,37 @@ fun main() {
   // but its wall time is reported as setupNs (includes <clinit> + classloading).
   val people = (1..1000).map { Person(it, "n$it") }
 
-  measure("filter-then-map") { Blackhole.consume(variantA(people)) }
-  measure("map-then-filter") { Blackhole.consume(variantB(people)) }   // optional 2nd block
+  measure { Blackhole.consume(work(people)) }        // EXACTLY ONE per submission
 }
 ```
 
-Timeline per block: `setup → block #1 (timed alone) → warmup × W (excluded) → armed window
-× N (measured) → dump`. Three timings reported per block (`setupNs`, `firstCallNs`,
-`steadyNsPerIter`) so one-time cost — including ORM session-factory construction and memoised
-query compilation — is **reported, never averaged into invisibility**. [MEASURED: naive
-amplification erased a cost that was 33% of a single run to 0% at N=500; analysis §5.2.]
+Timeline: `setup → call #1 (timed alone) → warmup × W (excluded) → armed window × N
+(measured) → dump`. Three timings reported (`setupNs`, `firstCallNs`, `steadyNsPerIter`) so
+one-time cost — including ORM session-factory construction and memoised query compilation —
+is **reported, never averaged into invisibility**. [MEASURED: naive amplification erased a
+cost that was 33% of a single run to 0% at N=500; analysis §5.2.]
 
-Named blocks amortise the compile cost across variants (compile once, measure k variants) —
-directly serving the "1000 microbenchmarks" positioning. The cross-block JIT-state caveat and
-the one-block-per-request recommendation for precise head-to-heads carry over, surfaced as
-the `multiBlockOrdering` finding.
+**One `measure` block per submission — enforced, not recommended.** An earlier draft allowed
+multiple named blocks to amortise compile cost across variants. It was cut, for a reason
+worth recording: measuring two variants in one JVM is **defect D6 of the scoring rubric** —
+the first block warms the JIT and pollutes the second's call-site profiles, systematically
+distorting exactly the A/B comparison that was the feature's only purpose. The study rig
+scored agents for committing D6; this product will not ship it as a convenience. Cutting it
+also strengthens the core guarantee to something unconditional — **every number comes from
+its own fresh JVM** — and deletes a raft of surface: block naming and dedup, per-block
+windows and dumps, the comparisons section, the `multiBlockOrdering` caveat, and the
+ambiguous error semantics of a half-failed multi-block run.
+
+Mechanics: `ProfileBootstrap.measure` throws `IllegalStateException` on a second call; the
+parent reports `status:"runtimeError"` with finding `multipleMeasureBlocks` and the hint
+*"one measure block per call — submit each variant as its own request."* An optional
+`measure("label") { }` name is kept purely as a report label.
+
+A/B comparison is therefore **two calls, two fresh JVMs** — which is the only clean way to
+make it anyway. If the compile cost of two calls proves material (P0 measures this), the fix
+is compile caching keyed on the dependency classpath, or a future `compare` request that
+takes two submissions and runs **two child JVMs** server-side — orchestration over the
+existing contract, never shared-JVM measurement.
 
 With an ORM runtime, `measure` composes with the bootstrap exactly as in the shipped tool:
 
@@ -464,8 +480,8 @@ ProfilingTransformer — complete source). Plan-level requirements:
   erasing a real 1.5% method to 0.0%; at C1 raw numbers are already within 0.6pp.] The
   calibrated probe cost is *reported* (`probeNs`) so a consumer can reason about it; it is
   not silently applied.
-- **Arming:** probes count only inside the measured window (`Probe.armed`), reset per block,
-  dumped per block to `profile-instrument-<block>.json` by a hand-rolled writer (no Jackson
+- **Arming:** probes count only inside the measured window (`Probe.armed`), armed once for
+  the single block, dumped to `profile-instrument.json` by a hand-rolled writer (no Jackson
   on the child's system classpath, where it could shadow the copy under test).
 - [TRAP T-8] The agent fat-jar **must include inner classes** — a missing `Agent$1` dies in
   `premain` as an opaque `InvocationTargetException`. The Gradle `jar` task from
@@ -477,8 +493,8 @@ ProfilingTransformer — complete source). Plan-level requirements:
 Reference implementation: `ephemeral-profiling-harness.md` §7.2 (`JfrWindow`) and §9.3
 (`JfrFold`). Plan-level requirements:
 
-- **Programmatic `jdk.jfr.Recording` per block**, `jdk.ExecutionSample` at
-  `samplePeriodMs`, window opened *after* setup + warmup, closed before the next block.
+- **One programmatic `jdk.jfr.Recording`**, `jdk.ExecutionSample` at
+  `samplePeriodMs`, window opened *after* setup + warmup, closed at the end of the block.
   [MEASURED: window-after-warmup yields 95% of samples in the block, 0 leaked from setup.]
 - **Never `-XX:StartFlightRecording`.** [TRAP T-1] It prints a banner **to stdout**,
   corrupting the JSON channel, and records JVM startup so samples land in
@@ -492,7 +508,7 @@ Reference implementation: `ephemeral-profiling-harness.md` §7.2 (`JfrWindow`) a
   leaf frame = self time, distinct frames per stack = total time, harness prefixes filtered
   (`executors.`, `java.lang.reflect.`, `jdk.internal.reflect.`, `jdk.jfr.`,
   `io.exoquery.profiler.`), JDK-internal frames rolled up to the nearest includable ancestor.
-- **Starvation is surfaced, not papered over:** `samples` reported per block; below 100 →
+- **Starvation is surfaced, not papered over:** `samples` reported; below 100 →
   finding `insufficientSamples` with hint *"raise iterations, or use mode.kind=instrument"*.
   This is the honest failure mode of sampling short blocks and the reason it is not the
   default.
@@ -530,7 +546,7 @@ measuring badly was itself measuring badly** — under-warmed on one arm (T-16),
 a 25% threshold (T-19). This tool is that arbiter, productised. These rules are therefore
 hard requirements, each traceable to a measured failure:
 
-1. **Every per-block result carries dispersion.** `steadyNsPerIter` is a median over the
+1. **Every result carries dispersion.** `steadyNsPerIter` is a median over the
    window's chunked sub-intervals, reported with `cv`. [MEASURED: CV 2.8–6.2% in the
    allocation-free regime collapsing to 51–56% under GC pressure, with mean/median diverging —
    a mean alone is a lie in exactly the cases that matter.]
@@ -538,11 +554,13 @@ hard requirements, each traceable to a measured failure:
    `"indeterminate"` and a `noisyMeasurement` finding explains what to change (fewer
    allocations, more iterations, one block per request). The tool **refuses to publish a
    ratio it cannot support** — the T-19 failure, made structurally impossible.
-3. **Comparisons never name a bare winner.** When ≥2 blocks are present, the response includes
-   pairwise `comparisons` with verdict
-   `"faster" | "slower" | "no_significant_difference" | "indeterminate"`, decided by
-   non-overlap of bootstrap CIs — not by which median is smaller. [MEASURED: at 5% threshold
-   and low reps, 10–22% of identical-workload comparisons produce a false winner.]
+3. **Comparisons never name a bare winner.** A/B is two calls (§5); whoever compares —
+   client-side guidance in the docs pages now, a server-side `compare` request later — must
+   decide by non-overlap of bootstrap CIs, with
+   `"faster" | "slower" | "no_significant_difference" | "indeterminate"` as the only legal
+   verdicts, never by which median is smaller. [MEASURED: at 5% threshold and low reps,
+   10–22% of identical-workload comparisons produce a false winner.] The per-result `ci95`
+   exists so this is computable from two responses without server help.
 4. **Auto-warmup adequacy.** After warmup, the harness compares the first and second halves of
    the measured window; drift > 10% → finding `warmupInsufficient` with the drift attached
    (the T-16 defect, self-diagnosed). It does not silently extend the window — budget belongs
@@ -644,32 +662,26 @@ day one because the CI consumer diffs this JSON across months.
   "output": "…stdout…",
   "timings": { "compileMs": 1840, "executeMs": 940, "sessionFactoryBuildMs": 390 },
 
-  "blocks": [
-    {
-      "name": "load-with-children",
-      "iterations": { "warmup": 5000, "measured": 20000 },   // as applied
-      "timings": { "setupNs": 17004312, "firstCallNs": 5301887,
-                   "steadyNsPerIter": 236612, "cv": 0.041 },
-      "verdict": "measured",           // "measured" | "indeterminate"
-      "frames": [                      // top 25 by selfPct
-        { "frame": "org.hibernate.metamodel.…", "selfPct": 31.2, "totalPct": 44.0,
-          "count": 20000 }             // selfPct/totalPct absent under "instrumented";
-      ],                               // count null under "sampled"
-      "calls": [                       // instrumented/instrumentedTimed only; top 25 by count
-        { "caller": "org.hibernate.….AbstractEntityPersister.hydrate",
-          "callee": "java.lang.reflect.Field.set", "count": 480000 }
-      ],
-      "samples": 1007                  // sampled only
-    }
-  ],
-
-  "comparisons": [                     // present when ≥2 blocks
-    { "a": "filter-then-map", "b": "map-then-filter",
-      "ratio": 1.42, "ci95": [1.31, 1.55], "verdict": "faster" }
-  ],
+  "block": {                           // exactly one per request (§5)
+    "label": "load-with-children",     // optional, cosmetic
+    "iterations": { "warmup": 5000, "measured": 20000 },   // as applied
+    "timings": { "setupNs": 17004312, "firstCallNs": 5301887,
+                 "steadyNsPerIter": 236612, "cv": 0.041,
+                 "ci95": [231800, 242100] },   // enables client-side A/B across two calls
+    "verdict": "measured",             // "measured" | "indeterminate"
+    "frames": [                        // top 25 by selfPct
+      { "frame": "org.hibernate.metamodel.…", "selfPct": 31.2, "totalPct": 44.0,
+        "count": 20000 }               // selfPct/totalPct absent under "instrumented";
+    ],                                 // count null under "sampled"
+    "calls": [                         // instrumented/instrumentedTimed only; top 25 by count
+      { "caller": "org.hibernate.….AbstractEntityPersister.hydrate",
+        "callee": "java.lang.reflect.Field.set", "count": 480000 }
+    ],
+    "samples": 1007                    // sampled only
+  },
 
   "findings": [
-    { "kind": "firstCallDominates", "block": "load-with-children",
+    { "kind": "firstCallDominates",
       "detail": "firstCallNs is 22x steadyNsPerIter",
       "hint": "Memoisation or lazy init inside the block; the steady profile is real but partial." }
   ],
@@ -682,12 +694,12 @@ day one because the CI consumer diffs this JSON across months.
 
 Full findings vocabulary: `noMeasureBlock` (with the contract snippet as the hint),
 `bodyOptimizedAway` (Blackhole untouched), `insufficientSamples`, `noisyMeasurement`,
-`warmupInsufficient`, `firstCallDominates`, `multiBlockOrdering`,
+`warmupInsufficient`, `firstCallDominates`, `multipleMeasureBlocks`,
 `unreliableClocksource`, `sessionFactoryDominates`, `lazyInitInWindow`, `codeTooLarge`,
-`tooManyBlocks`, `wrongJpaNamespace` (compile error against 5.6 with jakarta imports gets a
+`wrongJpaNamespace` (compile error against 5.6 with jakarta imports gets a
 targeted hint, since it is the predictable mistake).
 
-Caps: 25 frames, 25 call edges per block, findings unlimited (they are small). Output size is
+Caps: 25 frames, 25 call edges, findings unlimited (they are small). Output size is
 a product requirement — the agent consumer pays context for every byte.
 
 ---
@@ -709,7 +721,7 @@ INPUT, OUTPUT, docs pointer):
 
 Profile or microbenchmark Kotlin/Java code in an ephemeral sandboxed JVM and return
 exact call counts (instrumented), exact per-method timings (instrumentedTimed), or
-statistical time profiles (sampled) — plus per-block timings that separate one-time setup cost from
+statistical time profiles (sampled) — plus timings that separate one-time setup cost from
 steady-state cost, and verdicts that refuse to name a winner inside measurement noise.
 Optionally run the workload against Hibernate or EclipseLink (version-selectable) with
 an ephemeral in-memory H2 built from your schema, to profile where ORM time actually
@@ -730,7 +742,7 @@ executors.ProfileBootstrap.measure("name") { ... }, consuming results via
 Blackhole.consume(...). mode selects the backend; runtime selects plain JVM or an
 ORM stack; both are tagged unions — see the docs page.
 
-OUTPUT: JSON with status, per-block timings (setupNs / firstCallNs /
+OUTPUT: JSON with status, block timings (setupNs / firstCallNs /
 steadyNsPerIter / cv), top-N frames and call edges, pairwise comparisons with
 confidence intervals, and findings with hints. Compile failures return
 {"status":"compileError","errors":...} in the same envelope.
@@ -760,7 +772,7 @@ ExoBench gateway conventions (the tool is pool-gated like `benchmarkSql`); rate 
 the gateway's job, `profiler-api` only enforces the §4.5 clamps.
 
 The CI consumer targets this endpoint directly (a GitHub Action wrapping `POST /run` and
-diffing `blocks[].timings` against a baseline artifact is the natural v2 — out of scope here,
+diffing `block.timings` against a baseline artifact is the natural v2 — out of scope here,
 but `schemaVersion` and stable keys exist so it needs no server change).
 
 ---
@@ -818,19 +830,21 @@ Additional rules for this tool:
    behaviour change (byte-identical stdout). The bytecode-rewriting safety net; instrument
    backend cannot ship without it green.
 4. **Mode × runtime matrix** — {sampled, instrumented, instrumentedTimed} × {plain, hib 5.6/6.2/6.6/7.0,
-   el 2.7/3.0/4.0/5.0}: one smoke submission each, `status:"ok"`, non-empty blocks. Plus the
+   el 2.7/3.0/4.0/5.0}: one smoke submission each, `status:"ok"`, non-empty block. Plus the
    namespace-enforcement negatives (jakarta imports on 5.6 → `compileError` +
    `wrongJpaNamespace` finding).
 5. **Container smoke** — build the Docker image, call `/api/profiler/run` with an ORM request
    inside it. Exists solely because of TRAP T-9.
 6. **Statistical gates** — fixture with deliberate GC churn → `verdict:"indeterminate"` +
-   `noisyMeasurement`; identical-blocks fixture 50× → false-winner rate < 5% under the CI
-   comparison rule; under-warmed fixture → `warmupInsufficient` fires.
+   `noisyMeasurement`; identical submission measured 50× as call pairs → false-winner rate
+   < 5% under the documented two-call CI comparison rule; under-warmed fixture →
+   `warmupInsufficient` fires.
 7. **Seam tests** — adapters import nothing from core but `contract` + `ProfileService`;
    clamps applied identically through both doors; unknown ORM version rejected with the
    available-names list through both doors.
 8. **Contract negatives** — no `measure` call → `noMeasureBlock` with the snippet hint;
-   Blackhole untouched → `bodyOptimizedAway`; 9 blocks → `rejected`.
+   Blackhole untouched → `bodyOptimizedAway`; two `measure()` calls →
+   `runtimeError` + `multipleMeasureBlocks`.
 
 ---
 
@@ -841,7 +855,7 @@ Ordered; each gate blocks the next. Estimates assume the reference implementatio
 
 | # | Milestone | Contents | Gate | Est |
 |---|---|---|---|---|
-| **P0** | **Latency budget** | Timers around compile / write / execute on a representative submission, 20 runs, medians recorded **in this doc** | The split is known. If compile > 70% of wall time, open the compile-caching track and re-weigh named-blocks guidance | ½ d |
+| **P0** | **Latency budget** | Timers around compile / write / execute on a representative submission, 20 runs, medians recorded **in this doc** | The split is known. If compile > 70% of wall time, open the compile-caching track (and weigh the future two-JVM `compare` request) | ½ d |
 | **P1** | Core + contract + timings | `profiler-core` skeleton, coproducts, `ProfileBootstrap`/`Blackhole`/`ProfileRunner`, `profile()` entry, flags, clamps. No frames yet | Timings-only report through a direct `ProfileService` call; §17.8 negatives pass | 2 d |
 | **P2** | Sample backend | `JfrWindow`, policy grants, `JfrFold`, starvation finding | §17.4 sample×plain green; zero harness frames in output | 1–2 d |
 | **P3** | Instrument backend | `profiler-agent` module, counting first, call sites, arming, dump; timing behind flag second | §17.3 corpus green, then §17.1 agreement, then §17.2 determinism | 3–5 d |
