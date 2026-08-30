@@ -65,8 +65,8 @@ core knows which door the request came through.
 1. **Two front doors, one core.** An `mcp/` section and an `api/` section in the code, both
    delegating to the same `ProfileService`. No measurement logic in either adapter.
 2. **Both backends, selectable via a coproduct.** Instrumentation-based and sampling-based
-   profiling as previously designed and measured, chosen by a tagged union in the request —
-   plus a `both` variant that runs the two and cross-checks them (§9).
+   profiling as previously designed and measured, chosen by a tagged union in the request.
+   Each variant names the measurement you get; there is no orchestration variant (§4.2, §9).
 3. **Ephemeral.** Fresh temp dirs, fresh child JVM per execution, everything destroyed after
    the response is assembled. No state survives a request. `correlationId` is tracking only.
 4. **Selectable ORM runtime.** Hibernate 5.6 / 6.2 / 6.6 / 7.0 and EclipseLink 2.7 / 3.0 /
@@ -172,7 +172,7 @@ JSON; the adapters do nothing but deserialize and delegate.
   "code": "…",
 
   // WHICH BACKEND — the mode coproduct (§4.2). Discriminated on "kind".
-  "mode": { "kind": "instrument", "callSites": true, "timing": false },
+  "mode": { "kind": "instrumented", "callSites": true },
 
   // WHICH RUNTIME — the runtime coproduct (§4.3). Discriminated on "kind".
   "runtime": { "kind": "plain" },
@@ -192,55 +192,69 @@ payloads and the compiler should force exhaustive handling of them. On the wire 
 object discriminated on `"kind"`; in Kotlin it is a sealed interface; in the MCP schema it is
 a `oneOf`.
 
-```jsonc
-// Variant 1 — instrumentation. Exact counts; deterministic; the default.
-{ "kind": "instrument",
-  "callSites": true,        // count (caller → callee) edges incl. into the JDK boundary
-  "timing": false }         // per-method wall time via entry/exit probes. OFF by default (§7)
+Three variants, each naming **exactly the measurement produced** — no orchestration variant.
+An earlier draft had a fourth `both` variant that ran the two backends and cross-checked
+their self-time shares; it was removed because the cross-check is only defined against
+*timing* instrumentation (counts have no self% to join on) while the variant did not carry a
+timing flag — and because backend agreement is a property of the *system*, validated once by
+the §17.1 CI test, not something to re-derive per request at 2× execution cost. A caller who
+wants a cross-check makes two calls and diffs. See §9.
 
-// Variant 2 — sampling. JFR ExecutionSample; statistical self/total time.
-{ "kind": "sample",
+```jsonc
+// Variant 1 — JFR ExecutionSample. Statistical self/total time shares.
+// Near-zero overhead: absolute times are honest. Attribution is statistical
+// and starves on short blocks (surfaced as insufficientSamples).
+{ "kind": "sampled",
   "samplePeriodMs": 1 }     // clamped to [1, 20]
 
-// Variant 3 — both. Runs the window under both backends and cross-checks (§9).
-{ "kind": "both",
-  "callSites": true,
-  "samplePeriodMs": 1 }
+// Variant 2 — ASM entry + call-site COUNTING. Exact, byte-identical run over
+// run. No time attribution. The default: cheapest, most reproducible,
+// COMPUTE_MAXS only (no frame recomputation risk).
+{ "kind": "instrumented",
+  "callSites": true }       // count (caller → callee) edges incl. into the JDK boundary
+
+// Variant 3 — ASM entry/exit TIMING probes (which also count). Exact per-method
+// attribution. Absolute times are INFLATED by probe cost (reported as probeNs,
+// never silently subtracted); at C1 the SHARES survive [MEASURED: within 0.6 pp
+// of sampling]. Requires COMPUTE_FRAMES (§7). The expensive, precise variant.
+{ "kind": "instrumentedTimed",
+  "callSites": true }
 ```
 
 ```kotlin
 // profiler-core/contract/ProfileMode.kt
 @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY, property = "kind")
 @JsonSubTypes(
-  JsonSubTypes.Type(ProfileMode.Instrument::class, name = "instrument"),
-  JsonSubTypes.Type(ProfileMode.Sample::class,     name = "sample"),
-  JsonSubTypes.Type(ProfileMode.Both::class,       name = "both"),
+  JsonSubTypes.Type(ProfileMode.Sampled::class,           name = "sampled"),
+  JsonSubTypes.Type(ProfileMode.Instrumented::class,      name = "instrumented"),
+  JsonSubTypes.Type(ProfileMode.InstrumentedTimed::class, name = "instrumentedTimed"),
 )
 sealed interface ProfileMode {
-  data class Instrument(
-    val callSites: Boolean = true,
-    val timing: Boolean = false,
-  ) : ProfileMode
-
-  data class Sample(
-    val samplePeriodMs: Int = 1,
-  ) : ProfileMode
-
-  data class Both(
-    val callSites: Boolean = true,
-    val samplePeriodMs: Int = 1,
-  ) : ProfileMode
+  data class Sampled(val samplePeriodMs: Int = 1) : ProfileMode
+  data class Instrumented(val callSites: Boolean = true) : ProfileMode
+  data class InstrumentedTimed(val callSites: Boolean = true) : ProfileMode
 }
 ```
 
-Why instrumentation is the default, in one paragraph **[MEASURED]** (full tables:
-`ephemeral-profiling-harness.md` §5.3, analysis doc §6): a sampling window over a short
-program is starved (6 samples for a 63 ms run at 1 ms period), while counting probes cost
-1.1× interpreted / 4.4× at C2 and produce byte-identical results run over run — and
+The flat shape makes each variant's payload exactly its knobs — no illegal combinations are
+representable (a `samplePeriodMs` on an instrumented run, a `timing` flag whose meaning
+depends on the kind). Timing *implies* counting: `Probe.exit` increments the entry counter,
+so `instrumentedTimed` is a strict superset of `instrumented`'s output.
+
+**Division of labour, stated for the docs pages** — this is the real content of the choice:
+
+| | `sampled` | `instrumented` | `instrumentedTimed` |
+|---|---|---|---|
+| What you get | statistical self/total time shares | exact call counts + call-site edges | counts + exact per-method time |
+| Absolute times | **honest** (near-zero overhead) | n/a (no times) | **inflated by probe cost** (`probeNs` reported); shares valid at C1 |
+| Reproducibility | statistical | **byte-identical** [MEASURED] | counts identical; times within tolerance |
+| Overhead | ~none | 1.1× interpreted / 4.4× C2 on tiny methods | 2.7× interpreted / 34.7× C2 on tiny methods [MEASURED] |
+| Fails how | starves on short blocks | can't say where time went | `VerifyError` risk contained per-class (§7) |
+| Reach for it when | "where does wall time go" (esp. ORM) | loop iteration, CI diffing, "what got called" | exact attribution worth the overhead |
+
+**[DECISION]** `instrumented` is the default: cheapest, most reproducible, and
 reproducibility is what both consumers (agent diffing two results; CI diffing two commits)
-actually consume. Timing probes default OFF because they cost 34.7× on tiny methods at C2 and
-force `COMPUTE_FRAMES` bytecode rewriting (§7); counting carries most of the value at a
-fraction of the risk.
+actually consume.
 
 ### 4.3 The runtime coproduct
 
@@ -289,10 +303,10 @@ must import `javax.persistence.*` and will not compile against 6.x — *"a silen
 entity is worse than a compile error."*
 
 **Orthogonality is the point of two coproducts.** Any mode × any runtime is legal:
-`instrument × hibernate-6.6` counts every `org.hibernate.**` call the workload triggers;
-`sample × eclipselink-4.0` shows where wall time goes inside unwoven EclipseLink;
-`both × plain` is the cross-checked microbenchmark. The pipeline treats them as independent
-axes and a matrix test asserts every combination executes (§17.4).
+`instrumented × hibernate-6.6` counts every `org.hibernate.**` call the workload triggers;
+`sampled × eclipselink-4.0` shows where wall time goes inside unwoven EclipseLink;
+`instrumentedTimed × plain` is the exact-attribution microbenchmark. The pipeline treats
+them as independent axes and a matrix test asserts every combination executes (§17.4).
 
 ### 4.4 Validation and clamps
 
@@ -370,8 +384,7 @@ different contract.
    the envelope unchanged.
 2. **Materialise** — classes + rendered `executor.policy` into a second temp dir. Policy
    placeholders: `%%GENERATED%%`, `%%LIB_DIR%%`, `%%AGENT_DIR%%`, and (ORM only) `%%ORM_DIR%%`.
-3. **Execute** — one fresh child JVM, `ProfileRunner` main, flags from §6.3. For
-   `mode.kind == "both"`: **two** fresh child JVMs, sequential, same compiled classes (§9.1).
+3. **Execute** — one fresh child JVM per request, `ProfileRunner` main, flags from §6.3.
 4. **Collect** — parent reads `profile-instrument-<block>.json` / `profile-sample-<block>.jfr`
    from the temp dir **before** teardown. Never via stdout. **[TRAP T-3]**
 5. **Fold + verdict** — §9, §10.
@@ -393,14 +406,14 @@ different contract.
 ### 6.3 Child JVM flags
 
 ```
--XX:TieredStopAtLevel=1        ← LOAD-BEARING. Makes the two backends agree (§9.2) and
+-XX:TieredStopAtLevel=1        ← LOAD-BEARING. Makes the two backends agree (§9) and
                                  makes results reproducible. [MEASURED: backends diverge
                                  3–4× on sub-130ns methods at C2; agree within 0.6pp at C1.]
 -Xlog:jfr*=off                 ← keeps JFR banners off the JSON stdout channel [TRAP T-1]
 -Xmx256M                       ← plain runtime; 768M for ORM runtimes (H2 + entities + SF)
 -Dexo.profile.mode=…           ← read by ProfileBootstrap; never settable from user source
 -Dexo.profile.warmup=… -Dexo.profile.iterations=… -Dexo.profile.outDir=…
--javaagent:…/profiler-agent.jar=include=…;callsites=…;timing=…    ← instrument/both only
+-javaagent:…/profiler-agent.jar=include=…;callsites=…;timing=…    ← instrumented/instrumentedTimed only
 ```
 
 All assembled in `CommandLineArgument.toList()` **before** `-classpath` (anything after it
@@ -484,32 +497,29 @@ Reference implementation: `ephemeral-profiling-harness.md` §7.2 (`JfrWindow`) a
   This is the honest failure mode of sampling short blocks and the reason it is not the
   default.
 
-## 9. `both` — cross-checked measurement
+## 9. Cross-backend agreement — a CI property, not a request mode
 
-### 9.1 Execution
+An earlier draft offered a `both` request mode: two sequential fresh JVMs (never co-resident
+collectors — instrumentation changes what a sampler sees, so a shared JVM measures a third
+thing that is neither backend), joined on per-frame self%, emitting a `confidence` field.
+It was removed for two reasons, recorded here so it is not re-invented:
 
-Two fresh child JVMs, sequential, same compiled classes: one under the agent, one under JFR.
-**Not both collectors in one JVM** **[DECISION]** — instrumentation changes what the sampler
-sees (probe frames, blocked inlining even at C1), so co-resident collectors measure a third
-thing that is neither backend. Sequential fresh JVMs cost one extra execution and keep both
-measurements clean.
+1. **It was incoherent as specified.** The join is on self-time shares, which only
+   *timing* instrumentation produces — counting has no self%. The variant carried no timing
+   flag, so its instrument leg had nothing to reconcile; forcing timing on would have made
+   the deliberately opt-in, `COMPUTE_FRAMES`-bearing backend mandatory through a side door.
+2. **The agreement it re-derived is a system property, not a request property.**
+   [MEASURED: at C1, timing-instrumented shares and sampled shares agree within 0.6 pp on
+   every frame of the four-method fixture; at C2 they diverge up to 4×.] That fact is
+   established once and guarded continuously by the §17.1 agreement test — which is also the
+   guard on the `-XX:TieredStopAtLevel=1` flag itself. Charging every caller 2× execution to
+   re-verify it, for a `confidence` field with no clear consumer action, bought nothing the
+   test suite does not already own.
 
-### 9.2 Reconciliation
-
-Join folded frames on frame key. Rules (from the harness design, hardened by the study):
-
-1. `count` is instrumentation-only; `null` under sample — never fabricated.
-2. JDK frames roll up before joining, or the rows don't line up.
-3. Per joined frame: agreement within 2 pp of self% → `confidence: "high"`; within 5 pp →
-   `"medium"`; beyond → `"low"` **plus** a `backendDisagreement` finding naming the frame.
-
-The premise is [MEASURED]: at C1 the two backends agree within 0.6 pp on every frame of the
-four-method fixture; at C2 they diverge up to 4×. The cross-check is only meaningful because
-of the §6.3 pin, which is why the pin is non-negotiable.
-
-`both` costs ~2× execution time and is the recommended mode in the MCP docs for "the number
-is about to be acted on" moments; `instrument` for loop iteration; `sample` for "where does
-wall time go in this ORM call."
+A caller who wants a cross-check for a specific workload makes two calls — `sampled` and
+`instrumentedTimed` — and compares shares; the docs pages show the pattern. If demand
+materialises, a server-side convenience doing exactly that can be added later without
+touching the coproduct: it is orchestration over existing variants, not a new measurement.
 
 ---
 
@@ -627,7 +637,7 @@ day one because the CI consumer diffs this JSON across months.
 {
   "status": "ok",                      // "ok" | "compileError" | "timeout" | "rejected" | "runtimeError"
   "schemaVersion": "1",
-  "mode": { "kind": "instrument", "callSites": true, "timing": false },   // echoed, post-clamp
+  "mode": { "kind": "instrumented", "callSites": true },                  // echoed, post-clamp
   "runtime": { "kind": "hibernate", "version": "6.6" },                   // echoed
   "jitTier": "c1",
   "database": "h2-mem",                // ORM runtimes only
@@ -643,13 +653,13 @@ day one because the CI consumer diffs this JSON across months.
       "verdict": "measured",           // "measured" | "indeterminate"
       "frames": [                      // top 25 by selfPct
         { "frame": "org.hibernate.metamodel.…", "selfPct": 31.2, "totalPct": 44.0,
-          "count": 20000, "confidence": "high" }              // count null under sample;
-      ],                                                      // confidence only under both
-      "calls": [                       // instrument/both only; top 25 by count
+          "count": 20000 }             // selfPct/totalPct absent under "instrumented";
+      ],                               // count null under "sampled"
+      "calls": [                       // instrumented/instrumentedTimed only; top 25 by count
         { "caller": "org.hibernate.….AbstractEntityPersister.hydrate",
           "callee": "java.lang.reflect.Field.set", "count": 480000 }
       ],
-      "samples": 1007                  // sample/both only
+      "samples": 1007                  // sampled only
     }
   ],
 
@@ -672,7 +682,7 @@ day one because the CI consumer diffs this JSON across months.
 
 Full findings vocabulary: `noMeasureBlock` (with the contract snippet as the hint),
 `bodyOptimizedAway` (Blackhole untouched), `insufficientSamples`, `noisyMeasurement`,
-`warmupInsufficient`, `firstCallDominates`, `backendDisagreement`, `multiBlockOrdering`,
+`warmupInsufficient`, `firstCallDominates`, `multiBlockOrdering`,
 `unreliableClocksource`, `sessionFactoryDominates`, `lazyInitInWindow`, `codeTooLarge`,
 `tooManyBlocks`, `wrongJpaNamespace` (compile error against 5.6 with jakarta imports gets a
 targeted hint, since it is the predictable mistake).
@@ -698,8 +708,8 @@ INPUT, OUTPUT, docs pointer):
 [ExoBench server version: X.Y.Z]
 
 Profile or microbenchmark Kotlin/Java code in an ephemeral sandboxed JVM and return
-exact call counts (instrumentation), statistical time profiles (sampling), or both
-cross-checked — plus per-block timings that separate one-time setup cost from
+exact call counts (instrumented), exact per-method timings (instrumentedTimed), or
+statistical time profiles (sampled) — plus per-block timings that separate one-time setup cost from
 steady-state cost, and verdicts that refuse to name a winner inside measurement noise.
 Optionally run the workload against Hibernate or EclipseLink (version-selectable) with
 an ephemeral in-memory H2 built from your schema, to profile where ORM time actually
@@ -728,8 +738,8 @@ confidence intervals, and findings with hints. Compile failures return
 
 Docs pages (the `getMcpDocs` pattern): `profile-jvm` (contract, modes, minimal + comparison
 examples, the C1 statement), `profile-orm` (versions, namespace rule, schema requirements,
-HibBootstrap composition, the two ORM findings), `profiling-modes` (when instrument vs sample
-vs both, with the measured tables that justify the guidance).
+HibBootstrap composition, the two ORM findings), `profiling-modes` (the §4.2
+division-of-labour table, plus the two-call cross-check pattern from §9).
 
 The MCP handler is < 100 lines. If it grows, logic is leaking through the seam.
 
@@ -807,7 +817,7 @@ Additional rules for this tool:
 3. **Playground corpus** — all 580 snippets in `test-compile-data/jvm` run agented with no
    behaviour change (byte-identical stdout). The bytecode-rewriting safety net; instrument
    backend cannot ship without it green.
-4. **Mode × runtime matrix** — {instrument, sample, both} × {plain, hib 5.6/6.2/6.6/7.0,
+4. **Mode × runtime matrix** — {sampled, instrumented, instrumentedTimed} × {plain, hib 5.6/6.2/6.6/7.0,
    el 2.7/3.0/4.0/5.0}: one smoke submission each, `status:"ok"`, non-empty blocks. Plus the
    namespace-enforcement negatives (jakarta imports on 5.6 → `compileError` +
    `wrongJpaNamespace` finding).
@@ -836,13 +846,13 @@ Ordered; each gate blocks the next. Estimates assume the reference implementatio
 | **P2** | Sample backend | `JfrWindow`, policy grants, `JfrFold`, starvation finding | §17.4 sample×plain green; zero harness frames in output | 1–2 d |
 | **P3** | Instrument backend | `profiler-agent` module, counting first, call sites, arming, dump; timing behind flag second | §17.3 corpus green, then §17.1 agreement, then §17.2 determinism | 3–5 d |
 | **P4** | ORM runtimes | Classpath sets, `orm-common` bootstrap port, namespace-keyed allopen/noarg, H2, §11.4 grants, ORM findings | §17.4 full matrix green incl. negatives | 3–4 d |
-| **P5** | Both-mode + statistics | Sequential dual execution, reconciliation, confidence, comparisons, CIs, resolution gate, auto-warmup check | §17.6 gates green; §17.1 re-run through `both` | 2–3 d |
+| **P5** | Timed variant + statistics | `instrumentedTimed` (`COMPUTE_FRAMES` path), comparisons, CIs, resolution gate, auto-warmup check | §17.6 gates green; §17.1 agreement test green (`sampled` vs `instrumentedTimed`) | 2–3 d |
 | **P6** | Front doors | `profiler-api` endpoints, `profileJvm` MCP tool + description + three docs pages, seam tests | §17.7 green; docs pages reviewed against house style | 2 d |
 | **P7** | Hardening + deploy | Dockerfile (incl. the T-9 fix), buildLambda, container smoke, quota wiring | §17.5 green in the built image | 1–2 d |
 
-Total: **15–20 days.** If forced to cut: ship P0–P3 + P6 (instrument-only, plain-only, both
-doors) — that is already the "1000 microbenchmarks, no infra" product; sampling, ORM, and
-cross-checking are additive.
+Total: **15–20 days.** If forced to cut: ship P0–P3 + P6 (`instrumented`-only, plain-only,
+both doors) — that is already the "1000 microbenchmarks, no infra" product; `sampled`, ORM,
+and `instrumentedTimed` are additive.
 
 ---
 
